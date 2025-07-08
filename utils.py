@@ -1,3 +1,7 @@
+import pandas as pd, numpy as np, xarray as xr
+import traceback, pickle
+import json, urllib.error
+
 def load_streamflow_for_gauge(gauge_id):
     path = Path("/path/to/your/streamflow") / f"{gauge_id}.csv"
     return pd.read_csv(path, parse_dates=["date"])
@@ -34,6 +38,15 @@ def samples_to_xarray(samples):
         )
     )
     return ds
+
+def build_sample_from_disk(gauge_id, split, date):
+    try:
+        dfQ = load_streamflow_for_gauge(gauge_id)
+        return build_sample(gauge_id, split, date, dfQ)
+    except Exception as e:
+        print(f"[{gauge_id}] Failed to build sample for {split} {date}: {e}")
+        return None
+
 
 def build_sample(gauge_id: str, split: str, fcst_date: pd.Timestamp, df_streamflow):
     """
@@ -126,9 +139,9 @@ def build_sample(gauge_id: str, split: str, fcst_date: pd.Timestamp, df_streamfl
         traceback.print_exc()
         return None
 
-def get_or_download_streamflows(df, start_date="2015-01-01", end_date="2024-12-31"):
-    streamflow_file = FINAL_OUT / "streamflows.pkl"
-    skipped_file    = FINAL_OUT / "skipped_gauges.txt"
+def get_or_download_streamflows(df, STREAMFLOW_PATH, start_date="2015-01-01", end_date="2024-12-31"):
+    streamflow_file = STREAMFLOW_PATH / "streamflows.pkl"
+    skipped_file    = STREAMFLOW_PATH / "skipped_gauges.txt"
 
     if streamflow_file.exists() and skipped_file.exists():
         print("🔁 Loading cached streamflows and skipped gauges...")
@@ -150,7 +163,7 @@ def get_or_download_streamflows(df, start_date="2015-01-01", end_date="2024-12-3
                 streamflows[g] = dfQ
 
         # Save results
-        FINAL_OUT.mkdir(exist_ok=True)
+        STREAMFLOW_PATH.mkdir(exist_ok=True)
         with open(streamflow_file, "wb") as f:
             pickle.dump(streamflows, f)
         with open(skipped_file, "w") as f:
@@ -213,10 +226,3 @@ def get_usgs_streamflow(site, start_date, end_date, min_end_date="2024-12-31"):
 # streamflow_data = get_usgs_streamflow(site_id, start, end)
 # print(streamflow_data.tail())
 
-def build_sample_from_disk(gauge_id, split, date):
-    try:
-        dfQ = load_streamflow_for_gauge(gauge_id)
-        return build_sample(gauge_id, split, date, dfQ)
-    except Exception as e:
-        print(f"[{gauge_id}] Failed to build sample for {split} {date}: {e}")
-        return None
