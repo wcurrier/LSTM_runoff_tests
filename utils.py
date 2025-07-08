@@ -42,10 +42,10 @@ def samples_to_xarray(samples):
 
 def build_sample_wrapped(gauge_id, split, date, dfQ, ds_era5, ds_hres):
     try:
-        print(f"🔧 Building sample for {gauge_id} on {date} in {split} split", flush=True)
+        # print(f"🔧 Building sample for {gauge_id} on {date} in {split} split", flush=True)
         result = build_sample(gauge_id, split, date, dfQ, ds_era5, ds_hres)
-        if result is not None:
-            print(f"✅ Successfully built sample for {gauge_id} on {date}", flush=True)
+        # if result is not None:
+            # print(f"✅ Successfully built sample for {gauge_id} on {date}", flush=True)
         return result
     except Exception as e:
         print(f"❌ [{gauge_id}] Failed to build sample for {split} {date}: {e}", flush=True)
@@ -103,7 +103,7 @@ def build_sample(gauge_id: str, split: str, fcst_date: pd.Timestamp, df_streamfl
         fc_t = fcst['hres_temperature_2m']
         fc_s = fcst['hres_surface_net_solar_radiation']
 
-        print(f"[{gauge_id}] {fcst_date.date()} fcst dates available: {ds_fcst.date.values[:5]} ...")
+        # print(f"[{gauge_id}] {fcst_date.date()} fcst dates available: {ds_fcst.date.values[:5]} ...")
 
         # concat ----------------------------------------------------
         precip = xr.concat([obs_wp, obs_dp, fc_p], dim='date')
