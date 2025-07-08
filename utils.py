@@ -1,10 +1,11 @@
 import pandas as pd, numpy as np, xarray as xr
 import traceback, pickle
 import json, urllib.error
+from pathlib import Path
 
-def load_streamflow_for_gauge(gauge_id):
-    path = Path("/path/to/your/streamflow") / f"{gauge_id}.csv"
-    return pd.read_csv(path, parse_dates=["date"])
+BASE_OBS  = Path('/Projects/HydroMet/currierw/ERA5_LAND')
+BASE_FCST = Path('/Projects/HydroMet/currierw/HRES')
+EXPECTED_LEN = 106
 
 def samples_to_xarray(samples):
     n = len(samples)
@@ -39,16 +40,20 @@ def samples_to_xarray(samples):
     )
     return ds
 
-def build_sample_from_disk(gauge_id, split, date):
+def build_sample_wrapped(gauge_id, split, date, dfQ, ds_era5, ds_hres):
     try:
-        dfQ = load_streamflow_for_gauge(gauge_id)
-        return build_sample(gauge_id, split, date, dfQ)
+        print(f"🔧 Building sample for {gauge_id} on {date} in {split} split", flush=True)
+        result = build_sample(gauge_id, split, date, dfQ, ds_era5, ds_hres)
+        if result is not None:
+            print(f"✅ Successfully built sample for {gauge_id} on {date}", flush=True)
+        return result
     except Exception as e:
-        print(f"[{gauge_id}] Failed to build sample for {split} {date}: {e}")
+        print(f"❌ [{gauge_id}] Failed to build sample for {split} {date}: {e}", flush=True)
+        import traceback; traceback.print_exc()
         return None
 
 
-def build_sample(gauge_id: str, split: str, fcst_date: pd.Timestamp, df_streamflow):
+def build_sample(gauge_id: str, split: str, fcst_date: pd.Timestamp, df_streamflow, ds_era5, ds_hres):
     """
     Returns dict | None.  No huge objects passed around.
     """
@@ -57,11 +62,8 @@ def build_sample(gauge_id: str, split: str, fcst_date: pd.Timestamp, df_streamfl
     try:
         # print(f"START [{gauge_id}] {fcst_date}")
 
-        # print(f"[{gauge_id}] {fcst_date.date()} loading ERA5")
-        ds_obs  = era5().sel(basin=f'camels_{gauge_id}')
-
-        # print(f"[{gauge_id}] {fcst_date.date()} loading HRES")
-        ds_fcst = hres().sel(basin=f'camels_{gauge_id}')
+        ds_obs  = ds_era5.sel(basin=f'camels_{gauge_id}')
+        ds_fcst = ds_hres.sel(basin=f'camels_{gauge_id}')
 
 
         # windows ---------------------------------------------------
