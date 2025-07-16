@@ -14,10 +14,16 @@ from pathlib import Path
 from collections import Counter
 import glob
 import re
+import gc
 
 
 BATCH_SIZE = 200
 intermediate_store = []
+
+
+# 📦 Load all pre-saved streamflow data
+print("📥 Loading pre-saved streamflow data...")
+streamflow_df_dict = pd.read_pickle('/Projects/HydroMet/currierw/HRES_processed/streamflows.pkl')
 
 def get_last_processed_entry(split, output_dir="/Projects/HydroMet/currierw/HRES_processed/"):
     pattern = os.path.join(output_dir, f"{split}_data_batch*.nc")
@@ -140,45 +146,45 @@ def write_batch(split, batch, count):
     ds.to_netcdf(path)
     print(f"✅ Saved batch: {fname}")
     
-def get_usgs_streamflow(site, start_date, end_date):
-    """
-    Download daily streamflow data from USGS NWIS for a given site and date range.
+# def get_usgs_streamflow(site, start_date, end_date):
+#     """
+#     Download daily streamflow data from USGS NWIS for a given site and date range.
 
-    Parameters:
-        site (str): USGS site number (gauge ID)
-        start_date (str): Start date in 'YYYY-MM-DD'
-        end_date (str): End date in 'YYYY-MM-DD'
+#     Parameters:
+#         site (str): USGS site number (gauge ID)
+#         start_date (str): Start date in 'YYYY-MM-DD'
+#         end_date (str): End date in 'YYYY-MM-DD'
 
-    Returns:
-        pd.DataFrame: DataFrame with datetime and streamflow values in cfs
-    """
-    url = (
-        "https://waterservices.usgs.gov/nwis/dv/"
-        "?format=rdb&sites={site}&startDT={start}&endDT={end}"
-        "&parameterCd=00060&siteStatus=all"
-    ).format(site=site, start=start_date, end=end_date)
+#     Returns:
+#         pd.DataFrame: DataFrame with datetime and streamflow values in cfs
+#     """
+#     url = (
+#         "https://waterservices.usgs.gov/nwis/dv/"
+#         "?format=rdb&sites={site}&startDT={start}&endDT={end}"
+#         "&parameterCd=00060&siteStatus=all"
+#     ).format(site=site, start=start_date, end=end_date)
 
-    df = pd.read_csv(url, comment='#', sep='\t', header=1, parse_dates=['20d'])
-    df = df.rename(columns={'14n': 'streamflow_cfs'})
-    df = df.rename(columns={'20d': 'date'})
-    df['streamflow_cfs'] = pd.to_numeric(df['streamflow_cfs'], errors='coerce')
+#     df = pd.read_csv(url, comment='#', sep='\t', header=1, parse_dates=['20d'])
+#     df = df.rename(columns={'14n': 'streamflow_cfs'})
+#     df = df.rename(columns={'20d': 'date'})
+#     df['streamflow_cfs'] = pd.to_numeric(df['streamflow_cfs'], errors='coerce')
 
-    # Convert to cubic meters per second (cms)
-    df['streamflow_cms'] = df['streamflow_cfs'] * 0.0283168
-    df = df[['date', 'streamflow_cms']]
-    df = df.set_index('date')
+#     # Convert to cubic meters per second (cms)
+#     df['streamflow_cms'] = df['streamflow_cfs'] * 0.0283168
+#     df = df[['date', 'streamflow_cms']]
+#     df = df.set_index('date')
 
-    return df
+#     return df
 
-# Example usage:
-# site_id = gaugeID  # Example gauge ID
-site_id = '09085000'
+# # Example usage:
+# # site_id = gaugeID  # Example gauge ID
+# site_id = '09085000'
 
-start = '2015-01-01'
-end = '2024-12-31'
+# start = '2015-01-01'
+# end = '2024-12-31'
 
-streamflow_data = get_usgs_streamflow(site_id, start, end)
-print(streamflow_data.tail())
+# streamflow_data = get_usgs_streamflow(site_id, start, end)
+# print(streamflow_data.tail())
 
 
 
@@ -226,7 +232,9 @@ p_all, t_all, s_all, flow_all, target_all = [], [], [], [], []
 expected_precip_shape = None       
 EXPECTED_LEN = 106
 
-
+ds_obs_all = xr.open_zarr(base_obs + 'camels_rechunked.zarr')
+ds_fcst_all   = xr.open_zarr(base_fcst + 'camels_rechunked.zarr',decode_timedelta=True)
+    
 # -----------------------------------
 # Loop through Gauges and Forecast Dates
 # -----------------------------------
@@ -243,6 +251,7 @@ for split, forecast_dates in forecast_blocks.items():
     print(f"🔁 Resuming from batch {count:05d} for split '{split}'")
     intermediate_store.clear()
 
+
     for gaugeID in gaugeIDs:
 
         print(f"🔍 Processing Gauge: {gaugeID} , {split}")
@@ -253,7 +262,7 @@ for split, forecast_dates in forecast_blocks.items():
                 print(f"⏩ Skipping gauge {gaugeID}")
                 continue
             elif gaugeID == last_gauge:
-                resume_dates = forecast_dates[forecast_dates > pd.Timestamp(last_date)]
+                resume_dates = forecast_dates[forecast_dates > pd.Timestamp(str(last_date))]
             else:
                 resume_flag = True
                 resume_dates = forecast_dates
@@ -262,16 +271,21 @@ for split, forecast_dates in forecast_blocks.items():
 
         
         try:
-            if gaugeID not in streamflow_cache:
-                streamflow_cache[gaugeID] = get_usgs_streamflow(gaugeID, '2015-01-01', '2024-12-31')
-            dfQ = streamflow_cache[gaugeID]
+            try:
+                dfQ = streamflow_df_dict[gaugeID]
+            except KeyError:
+                print(f"⚠️ Missing streamflow for gauge {gaugeID}, skipping.")
+                continue
 
-            ds_obs = xr.open_zarr(base_obs + 'camels_rechunked.zarr').sel(basin=f'camels_{gaugeID}')
+            ds_obs = ds_obs_all.sel(basin=f'camels_{gaugeID}')
+            # ds_obs = xr.open_zarr(base_obs + 'camels_rechunked.zarr').sel(basin=f'camels_{gaugeID}')
             ds_obs_p = ds_obs.sel(date=slice('2015-01-01', '2024-09-30'))['era5land_total_precipitation']
             ds_obs_t = ds_obs.sel(date=slice('2015-01-01', '2024-09-30'))['era5land_temperature_2m']
             ds_obs_s = ds_obs.sel(date=slice('2015-01-01', '2024-09-30'))['era5land_surface_net_solar_radiation']
-    
-            ds_fcst   = xr.open_zarr(base_fcst + 'camels_rechunked.zarr',decode_timedelta=True).sel(basin=f'camels_{gaugeID}')
+
+            ds_fcst = ds_fcst_all.sel(basin=f'camels_{gaugeID}')
+
+            # ds_fcst   = xr.open_zarr(base_fcst + 'camels_rechunked.zarr',decode_timedelta=True).sel(basin=f'camels_{gaugeID}')
     
             for fcst_date in forecast_dates:
                 try:
@@ -366,6 +380,8 @@ for split, forecast_dates in forecast_blocks.items():
                         write_batch(split, intermediate_store, count)
                         count += 1
                         intermediate_store.clear()
+                        del ds_obs, ds_fcst, ds_obs_p, ds_obs_t, ds_obs_s
+                        gc.collect()
                 
                 except Exception as e:
                     print(f"Skipping {fcst_date} for {gaugeID} due to error: {e}")
