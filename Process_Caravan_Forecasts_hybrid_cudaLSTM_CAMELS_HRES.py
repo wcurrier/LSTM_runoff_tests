@@ -12,10 +12,25 @@ from uuid import uuid4
 import os, multiprocessing, torch, psutil
 from pathlib import Path
 from collections import Counter
+import glob
+import re
 
 
 BATCH_SIZE = 200
 intermediate_store = []
+
+
+def get_last_batch_number(split, output_dir="/Projects/HydroMet/currierw/HRES_processed/"):
+    pattern = os.path.join(output_dir, f"{split}_data_batch*.nc")
+    files = glob.glob(pattern)
+    if not files:
+        return 0
+    batch_nums = []
+    for f in files:
+        match = re.search(rf"{split}_data_batch(\d+)\.nc", os.path.basename(f))
+        if match:
+            batch_nums.append(int(match.group(1)))
+    return max(batch_nums) + 1  # Resume at next batch number
 
 def to_xarray_dataset(samples, standardize=False):
     # Step 1: Count all time lengths (based on 'precip')
@@ -204,7 +219,8 @@ def unstandardize_tensor(tensor, mean, std):
 
 
 for split, forecast_dates in forecast_blocks.items():
-    count = 0
+    count = get_last_batch_number(split)
+    print(f"🔁 Resuming from batch {count:05d} for split '{split}'")
     intermediate_store.clear()
 
     for gaugeID in gaugeIDs:
