@@ -19,19 +19,37 @@ import re
 BATCH_SIZE = 200
 intermediate_store = []
 
-def get_processed_forecasts(split, output_dir="/Projects/HydroMet/currierw/HRES_processed/"):
-    files = glob.glob(os.path.join(output_dir, f"{split}_data_batch*.nc"))
-    processed = set()
-    for f in files:
-        try:
-            ds = xr.open_dataset(f)
-            gauges = ds["basin_id"].values
-            dates = ds["forecast_date"].values
-            for g, d in zip(gauges, dates):
-                processed.add((g, d))
-        except Exception as e:
-            print(f"⚠️ Failed to scan {f}: {e}")
-    return processed
+def get_last_processed_entry(split, output_dir="/Projects/HydroMet/currierw/HRES_processed/"):
+    pattern = os.path.join(output_dir, f"{split}_data_batch*.nc")
+    files = sorted(glob.glob(pattern))
+    if not files:
+        return None, None  # Nothing processed yet
+    latest = files[-1]
+    try:
+        ds = xr.open_dataset(latest)
+        basin_ids = ds["basin_id"].values
+        forecast_dates = ds["forecast_date"].values
+        if len(basin_ids) > 0:
+            return basin_ids[-1], forecast_dates[-1]  # last one in the file
+        else:
+            return None, None
+    except Exception as e:
+        print(f"⚠️ Failed to read last batch: {latest}: {e}")
+        return None, None
+
+# def get_processed_forecasts(split, output_dir="/Projects/HydroMet/currierw/HRES_processed/"):
+#     files = glob.glob(os.path.join(output_dir, f"{split}_data_batch*.nc"))
+#     processed = set()
+#     for f in files:
+#         try:
+#             ds = xr.open_dataset(f)
+#             gauges = ds["basin_id"].values
+#             dates = ds["forecast_date"].values
+#             for g, d in zip(gauges, dates):
+#                 processed.add((g, d))
+#         except Exception as e:
+#             print(f"⚠️ Failed to scan {f}: {e}")
+#     return processed
     
 def get_last_batch_number(split, output_dir="/Projects/HydroMet/currierw/HRES_processed/"):
     pattern = os.path.join(output_dir, f"{split}_data_batch*.nc")
@@ -208,14 +226,6 @@ p_all, t_all, s_all, flow_all, target_all = [], [], [], [], []
 expected_precip_shape = None       
 EXPECTED_LEN = 106
 
-# -----------------------------------
-# Helper: Standardization
-# -----------------------------------
-def standardize_tensor(tensor, mean, std):
-    return (tensor - mean) / std
-
-def unstandardize_tensor(tensor, mean, std):
-    return tensor * std + mean
 
 # -----------------------------------
 # Loop through Gauges and Forecast Dates
@@ -223,8 +233,12 @@ def unstandardize_tensor(tensor, mean, std):
 
 streamflow_cache = {}
 for split, forecast_dates in forecast_blocks.items():
+
+    last_gauge, last_date = get_last_processed_entry(split)
+    resume_flag = False if last_gauge else True
+
     count = get_last_batch_number(split)
-    processed_set = get_processed_forecasts(split)
+    # processed_set = get_processed_forecasts(split)
 
     print(f"🔁 Resuming from batch {count:05d} for split '{split}'")
     intermediate_store.clear()
@@ -232,6 +246,21 @@ for split, forecast_dates in forecast_blocks.items():
     for gaugeID in gaugeIDs:
 
         print(f"🔍 Processing Gauge: {gaugeID} , {split}")
+
+
+        if not resume_flag:
+            if gaugeID < last_gauge:
+                print(f"⏩ Skipping gauge {gaugeID}")
+                continue
+            elif gaugeID == last_gauge:
+                resume_dates = forecast_dates[forecast_dates > pd.Timestamp(last_date)]
+            else:
+                resume_flag = True
+                resume_dates = forecast_dates
+        else:
+            resume_dates = forecast_dates
+
+        
         try:
             if gaugeID not in streamflow_cache:
                 streamflow_cache[gaugeID] = get_usgs_streamflow(gaugeID, '2015-01-01', '2024-12-31')
@@ -245,9 +274,6 @@ for split, forecast_dates in forecast_blocks.items():
             ds_fcst   = xr.open_zarr(base_fcst + 'camels_rechunked.zarr',decode_timedelta=True).sel(basin=f'camels_{gaugeID}')
     
             for fcst_date in forecast_dates:
-                if (gaugeID, fcst_date.strftime("%Y-%m-%d")) in processed_set:
-                    print(f"⏩ Skipping already processed: {gaugeID}, {fcst_date.date()}")
-                    continue  # ⏩ Already processed
                 try:
                     # make weekly window
                     start_weekly = fcst_date - pd.Timedelta(days=305)
@@ -303,15 +329,6 @@ for split, forecast_dates in forecast_blocks.items():
                         np.full(forecast_data_p.date.size, 2)
                     ])
                     
-                    # target_values = q_daily.values.astype(np.float32).reshape(-1)
-
-
-                    if split == "train": # used to normalize
-                        p_all.append(precipitation_concat.values.astype(np.float32))
-                        t_all.append(temperature_concat.values.astype(np.float32))
-                        s_all.append(netSrad_concat.values.astype(np.float32))
-                        flow_all.append(q_combined.values.astype(np.float32))
-                        target_all.append(q_combined.values.astype(np.float32))
 
                     sample = {
                         'precip': precipitation_concat.values.astype(np.float32),
