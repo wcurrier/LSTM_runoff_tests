@@ -9,7 +9,7 @@ import pandas as pd
 import numpy as np
 import math
 from uuid import uuid4
-import os, multiprocessing, torch, psutil
+import os, multiprocessing, psutil
 from pathlib import Path
 from collections import Counter
 import glob
@@ -19,7 +19,20 @@ import re
 BATCH_SIZE = 200
 intermediate_store = []
 
-
+def get_processed_forecasts(split, output_dir="/Projects/HydroMet/currierw/HRES_processed/"):
+    files = glob.glob(os.path.join(output_dir, f"{split}_data_batch*.nc"))
+    processed = set()
+    for f in files:
+        try:
+            ds = xr.open_dataset(f)
+            gauges = ds["basin_id"].values
+            dates = ds["forecast_date"].values
+            for g, d in zip(gauges, dates):
+                processed.add((g, d))
+        except Exception as e:
+            print(f"⚠️ Failed to scan {f}: {e}")
+    return processed
+    
 def get_last_batch_number(split, output_dir="/Projects/HydroMet/currierw/HRES_processed/"):
     pattern = os.path.join(output_dir, f"{split}_data_batch*.nc")
     files = glob.glob(pattern)
@@ -32,7 +45,7 @@ def get_last_batch_number(split, output_dir="/Projects/HydroMet/currierw/HRES_pr
             batch_nums.append(int(match.group(1)))
     return max(batch_nums) + 1  # Resume at next batch number
 
-def to_xarray_dataset(samples, standardize=False):
+def to_xarray_dataset(samples, split=None, standardize=False):
     # Step 1: Count all time lengths (based on 'precip')
     lengths = [s['precip'].shape[0] for s in samples]
     length_counts = Counter(lengths)
@@ -103,7 +116,7 @@ def to_xarray_dataset(samples, standardize=False):
     
 
 def write_batch(split, batch, count):
-    ds = to_xarray_dataset(batch, standardize=False)
+    ds = to_xarray_dataset(batch, split=split, standardize=False)
     fname = f"{split}_data_batch{count:05d}.nc"
     path = f"/Projects/HydroMet/currierw/HRES_processed/{fname}"
     ds.to_netcdf(path)
@@ -153,10 +166,6 @@ print(streamflow_data.tail())
 
 df=gpd.read_file('/Projects/HydroMet/currierw/Caravan-Jan25-csv/shapefiles/camels/camels_basin_shapes.shp')
 
-gaugeIDs=[]
-for i in range(0,len(df)):
-    gaugeIDs.append(df['gauge_id'][i].split('_')[-1])
-
 
 
 
@@ -193,11 +202,6 @@ forecast_blocks = {
     "test": pd.date_range('2022-10-01', '2024-09-30', freq='5D'),
 }
 
-dataset_store = {
-    "train": [],
-    "validation": [],
-    "test": []
-}
 
 p_all, t_all, s_all, flow_all, target_all = [], [], [], [], []
 
@@ -217,17 +221,20 @@ def unstandardize_tensor(tensor, mean, std):
 # Loop through Gauges and Forecast Dates
 # -----------------------------------
 
-
+streamflow_cache = {}
 for split, forecast_dates in forecast_blocks.items():
     count = get_last_batch_number(split)
+    processed_set = get_processed_forecasts(split)
+
     print(f"🔁 Resuming from batch {count:05d} for split '{split}'")
     intermediate_store.clear()
 
     for gaugeID in gaugeIDs:
+
         print(f"🔍 Processing Gauge: {gaugeID} , {split}")
         try:
-            dfQ = get_usgs_streamflow(gaugeID, '2015-01-01', '2024-12-31')
-    
+            if gaugeID not in streamflow_cache:
+                streamflow_cache[gaugeID] = get_usgs_streamflow(gaugeID, '2015-01-01', '2024-12-31')
             ds_obs = xr.open_zarr(base_obs + 'camels_rechunked.zarr').sel(basin=f'camels_{gaugeID}')
             ds_obs_p = ds_obs.sel(date=slice('2015-01-01', '2024-09-30'))['era5land_total_precipitation']
             ds_obs_t = ds_obs.sel(date=slice('2015-01-01', '2024-09-30'))['era5land_temperature_2m']
@@ -236,7 +243,9 @@ for split, forecast_dates in forecast_blocks.items():
             ds_fcst   = xr.open_zarr(base_fcst + 'camels_rechunked.zarr',decode_timedelta=True).sel(basin=f'camels_{gaugeID}')
     
             for fcst_date in forecast_dates:
-
+                if (gaugeID, fcst_date.strftime("%Y-%m-%d")) in processed_set:
+                    print(f"⏩ Skipping already processed: {gaugeID}, {fcst_date.date()}")
+                    continue  # ⏩ Already processed
                 try:
                     # make weekly window
                     start_weekly = fcst_date - pd.Timedelta(days=305)
@@ -292,7 +301,7 @@ for split, forecast_dates in forecast_blocks.items():
                         np.full(forecast_data_p.date.size, 2)
                     ])
                     
-                    target_values = q_daily.values.astype(np.float32).reshape(-1)
+                    # target_values = q_daily.values.astype(np.float32).reshape(-1)
 
 
                     if split == "train": # used to normalize
@@ -349,53 +358,11 @@ for split, forecast_dates in forecast_blocks.items():
     # Write final remainder
     if intermediate_store:
         write_batch(split, intermediate_store, count)
-
-for split in ["train", "validation", "test"]:
-    files = f"/Projects/HydroMet/currierw/HRES_processed/{split}_data_batch*.nc"
-    ds_all = xr.open_mfdataset(files, combine='nested', concat_dim='sample')
-    ds_all.to_netcdf(f"/Projects/HydroMet/currierw/HRES_processed/{split}_data_combined.nc")
-
-
-# # -----------------------------------
-# # ⚖️ Standardize
-# # -----------------------------------
-# p_all = np.concatenate(p_all)
-# t_all = np.concatenate(t_all)
-# s_all = np.concatenate(s_all)
-# flow_all = np.concatenate(flow_all)
-# target_all = np.concatenate(target_all)
-
-# scaler = {
-#     'precip': (p_all.mean(), p_all.std()),
-#     'temp': (t_all.mean(), t_all.std()),
-#     'net_solar': (s_all.mean(), s_all.std()),
-#     'flow': (flow_all.mean(), flow_all.std()),
-#     'target': (target_all.mean(), target_all.std())
-# }
-
-
-# In[ ]:
-
-
-# from collections import Counter
-
-
-
-
-# # In[ ]:
-
-
-# # Write 2 NetCDF files (train + validation) unstandardized
-# for split in ["train", "validation", "test"]:
-# # split="test"
-#     std = False
-#     ds = to_xarray_dataset(
-#         dataset_store[split],
-#         standardize=False,
-#         scaler=scaler
-#     )
-#     suffix = "standardized" if std else "unstandardized"
-#     fname = f"{split}_data_ERA5_HRES_CAMELS_{suffix}.nc"
-#     ds.to_netcdf('/Projects/HydroMet/currierw/HRES_processed/'+fname)
-#     print(f"Saved: {fname}")
+        print(f"✅ Final batch written for split '{split}'")
+        
+if False:  # change to True when you're ready
+    for split in ["train", "validation", "test"]:
+        files = f"/Projects/HydroMet/currierw/HRES_processed/{split}_data_batch*.nc"
+        ds_all = xr.open_mfdataset(files, combine='nested', concat_dim='sample')
+        ds_all.to_netcdf(f"/Projects/HydroMet/currierw/HRES_processed/{split}_data_combined.nc")
 
