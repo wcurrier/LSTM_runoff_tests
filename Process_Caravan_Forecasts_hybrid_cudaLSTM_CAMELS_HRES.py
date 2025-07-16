@@ -235,6 +235,8 @@ for split, forecast_dates in forecast_blocks.items():
         try:
             if gaugeID not in streamflow_cache:
                 streamflow_cache[gaugeID] = get_usgs_streamflow(gaugeID, '2015-01-01', '2024-12-31')
+            dfQ = streamflow_cache[gaugeID]
+
             ds_obs = xr.open_zarr(base_obs + 'camels_rechunked.zarr').sel(basin=f'camels_{gaugeID}')
             ds_obs_p = ds_obs.sel(date=slice('2015-01-01', '2024-09-30'))['era5land_total_precipitation']
             ds_obs_t = ds_obs.sel(date=slice('2015-01-01', '2024-09-30'))['era5land_temperature_2m']
