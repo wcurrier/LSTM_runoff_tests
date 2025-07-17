@@ -16,16 +16,59 @@ import glob
 import re
 import gc
 
+# -----------------------------------
+# Setup
+# -----------------------------------
+# ERA5 = 1950-01-01 - 2024-10-31
+# HRES = 2016-01-01 - 2024-09-30
+# Train on 2016-01-01 - 2020-09-30, (4 years)
+# Validate on 2020-10-01 - 2022-09-30 (2 years)
+# Test on 2022-10-01 - 2024-09-30 (2 years)
+
+# 2 meter temperature
+# total precipitation
+# net solar radiation
+
+"""|<--- 294d (weekly) --->|<-- 60d (daily) -->|<--- 10d (forecast) -->|
+       Weekly ERA5           Daily ERA5            HREF Forecast
+        (n=42)                (n=60)                  (n=10)
+        """
+
 
 BATCH_SIZE = 200
 intermediate_store = []
+expected_precip_shape = None       
+EXPECTED_LEN = 106
+output_dir="/Projects/HydroMet/currierw/HRES_processed/"
 
+# Load in CAMELS Data
+df=gpd.read_file('/Projects/HydroMet/currierw/Caravan-Jan25-csv/shapefiles/camels/camels_basin_shapes.shp')
+gaugeIDs=[]
+for i in range(0,len(df)):
+    gaugeIDs.append(df['gauge_id'][i].split('_')[-1])
 
-# 📦 Load all pre-saved streamflow data
+# Load all pre-saved streamflow data
 print("📥 Loading pre-saved streamflow data...")
-streamflow_df_dict = pd.read_pickle('/Projects/HydroMet/currierw/HRES_processed/streamflows.pkl')
+streamflow_df_dict = pd.read_pickle(output_dir+'streamflows.pkl')
 
-def get_last_processed_entry(split, output_dir="/Projects/HydroMet/currierw/HRES_processed/"):
+# Load in meterological observations and forecasts
+base_obs = '/Projects/HydroMet/currierw/ERA5_LAND/'
+base_fcst = '/Projects/HydroMet/currierw/HRES/'
+ds_obs_all = xr.open_zarr(base_obs + 'camels_rechunked.zarr').sel(date=slice('2015-01-01', '2024-09-30')).load()
+ds_fcst_all   = xr.open_zarr(base_fcst + 'camels_rechunked.zarr',decode_timedelta=True).load()
+print('loaded in forecast and obs to memory')
+
+# Set up training validation and test period
+forecast_blocks = {
+    "train": pd.date_range('2016-01-01', '2020-09-30', freq='5D'),
+    "validation": pd.date_range('2020-10-01', '2022-09-30', freq='5D'),
+    "test": pd.date_range('2022-10-01', '2024-09-30', freq='5D'),
+}
+
+# -----------------------------------
+# Functions
+# -----------------------------------
+def get_last_processed_entry(split, output_dir=output_dir):
     pattern = os.path.join(output_dir, f"{split}_data_batch*.nc")
     files = sorted(glob.glob(pattern))
     if not files:
@@ -42,22 +85,8 @@ def get_last_processed_entry(split, output_dir="/Projects/HydroMet/currierw/HRES
     except Exception as e:
         print(f"⚠️ Failed to read last batch: {latest}: {e}")
         return None, None
-
-# def get_processed_forecasts(split, output_dir="/Projects/HydroMet/currierw/HRES_processed/"):
-#     files = glob.glob(os.path.join(output_dir, f"{split}_data_batch*.nc"))
-#     processed = set()
-#     for f in files:
-#         try:
-#             ds = xr.open_dataset(f)
-#             gauges = ds["basin_id"].values
-#             dates = ds["forecast_date"].values
-#             for g, d in zip(gauges, dates):
-#                 processed.add((g, d))
-#         except Exception as e:
-#             print(f"⚠️ Failed to scan {f}: {e}")
-#     return processed
     
-def get_last_batch_number(split, output_dir="/Projects/HydroMet/currierw/HRES_processed/"):
+def get_last_batch_number(split, output_dir=output_dir):
     pattern = os.path.join(output_dir, f"{split}_data_batch*.nc")
     files = glob.glob(pattern)
     if not files:
@@ -79,7 +108,7 @@ def to_xarray_dataset(samples, split=None, standardize=False):
 
     REQUIRED_KEYS = ['precip', 'temp', 'net_solar', 'target', 'flag']
 
-    # 🔍 Optional: Print samples with mismatched array lengths
+    # Optional: Print samples with mismatched array lengths
     for s in samples:
         lengths = {k: s[k].shape[0] for k in REQUIRED_KEYS}
         if len(set(lengths.values())) > 1:
@@ -98,7 +127,6 @@ def to_xarray_dataset(samples, split=None, standardize=False):
     if not clean_samples:
         raise ValueError("No valid samples with consistent length")
 
-    # ✅ Missing before — now added:
     n_samples = len(clean_samples)
     n_time = EXPECTED_LEN
     dyn_inputs = np.zeros((n_samples, n_time, 4), dtype=np.float32)
@@ -138,124 +166,29 @@ def to_xarray_dataset(samples, split=None, standardize=False):
         }
     )
     
-
 def write_batch(split, batch, count):
     ds = to_xarray_dataset(batch, split=split, standardize=False)
     fname = f"{split}_data_batch{count:05d}.nc"
     path = f"/Projects/HydroMet/currierw/HRES_processed/{fname}"
     ds.to_netcdf(path)
     print(f"✅ Saved batch: {fname}")
-    
-# def get_usgs_streamflow(site, start_date, end_date):
-#     """
-#     Download daily streamflow data from USGS NWIS for a given site and date range.
-
-#     Parameters:
-#         site (str): USGS site number (gauge ID)
-#         start_date (str): Start date in 'YYYY-MM-DD'
-#         end_date (str): End date in 'YYYY-MM-DD'
-
-#     Returns:
-#         pd.DataFrame: DataFrame with datetime and streamflow values in cfs
-#     """
-#     url = (
-#         "https://waterservices.usgs.gov/nwis/dv/"
-#         "?format=rdb&sites={site}&startDT={start}&endDT={end}"
-#         "&parameterCd=00060&siteStatus=all"
-#     ).format(site=site, start=start_date, end=end_date)
-
-#     df = pd.read_csv(url, comment='#', sep='\t', header=1, parse_dates=['20d'])
-#     df = df.rename(columns={'14n': 'streamflow_cfs'})
-#     df = df.rename(columns={'20d': 'date'})
-#     df['streamflow_cfs'] = pd.to_numeric(df['streamflow_cfs'], errors='coerce')
-
-#     # Convert to cubic meters per second (cms)
-#     df['streamflow_cms'] = df['streamflow_cfs'] * 0.0283168
-#     df = df[['date', 'streamflow_cms']]
-#     df = df.set_index('date')
-
-#     return df
-
-# # Example usage:
-# # site_id = gaugeID  # Example gauge ID
-# site_id = '09085000'
-
-# start = '2015-01-01'
-# end = '2024-12-31'
-
-# streamflow_data = get_usgs_streamflow(site_id, start, end)
-# print(streamflow_data.tail())
-
-
-
-df=gpd.read_file('/Projects/HydroMet/currierw/Caravan-Jan25-csv/shapefiles/camels/camels_basin_shapes.shp')
-
-
-
-
 
 # -----------------------------------
-# Setup
-# -----------------------------------
-# ERA5 = 1950-01-01 - 2024-10-31
-# HRES = 2016-01-01 - 2024-09-30
-# Train on 2016-01-01 - 2020-09-30, (4 years)
-# Validate on 2020-10-01 - 2022-09-30 (2 years)
-# Test on 2022-10-01 - 2024-09-30 (2 years)
-
-# 2 meter temperature
-# total precipitation
-# net solar radiation
-
-"""|<--- 294d (weekly) --->|<-- 60d (daily) -->|<--- 10d (forecast) -->|
-       Weekly ERA5           Daily ERA5            HREF Forecast
-        (n=42)                (n=60)                  (n=10)
-        """
-
-gaugeIDs=[]
-for i in range(0,len(df)):
-    gaugeIDs.append(df['gauge_id'][i].split('_')[-1])
-# gaugeIDs=gaugeIDs[::12]
-
-base_obs = '/Projects/HydroMet/currierw/ERA5_LAND/'
-base_fcst = '/Projects/HydroMet/currierw/HRES/'
-
-forecast_blocks = {
-    "train": pd.date_range('2016-01-01', '2020-09-30', freq='5D'),
-    "validation": pd.date_range('2020-10-01', '2022-09-30', freq='5D'),
-    "test": pd.date_range('2022-10-01', '2024-09-30', freq='5D'),
-}
-
-
-p_all, t_all, s_all, flow_all, target_all = [], [], [], [], []
-
-expected_precip_shape = None       
-EXPECTED_LEN = 106
-
-ds_obs_all = xr.open_zarr(base_obs + 'camels_rechunked.zarr')
-ds_fcst_all   = xr.open_zarr(base_fcst + 'camels_rechunked.zarr',decode_timedelta=True)
-    
-# -----------------------------------
-# Loop through Gauges and Forecast Dates
+# Main Loop
 # -----------------------------------
 
-streamflow_cache = {}
 for split, forecast_dates in forecast_blocks.items():
 
     last_gauge, last_date = get_last_processed_entry(split)
     resume_flag = False if last_gauge else True
 
     count = get_last_batch_number(split)
-    # processed_set = get_processed_forecasts(split)
-
+    
+    print(f"🔁 Resume is {resume_flag} last gauge is '{last_gauge} last date is '{last_date}'")
     print(f"🔁 Resuming from batch {count:05d} for split '{split}'")
     intermediate_store.clear()
 
-
     for gaugeID in gaugeIDs:
-
-        print(f"🔍 Processing Gauge: {gaugeID} , {split}")
-
 
         if not resume_flag:
             if gaugeID < last_gauge:
@@ -269,7 +202,8 @@ for split, forecast_dates in forecast_blocks.items():
         else:
             resume_dates = forecast_dates
 
-        
+        print(f"🔍 Processing Gauge: {gaugeID} , {split}")
+
         try:
             try:
                 dfQ = streamflow_df_dict[gaugeID]
@@ -278,14 +212,11 @@ for split, forecast_dates in forecast_blocks.items():
                 continue
 
             ds_obs = ds_obs_all.sel(basin=f'camels_{gaugeID}')
-            # ds_obs = xr.open_zarr(base_obs + 'camels_rechunked.zarr').sel(basin=f'camels_{gaugeID}')
-            ds_obs_p = ds_obs.sel(date=slice('2015-01-01', '2024-09-30'))['era5land_total_precipitation']
-            ds_obs_t = ds_obs.sel(date=slice('2015-01-01', '2024-09-30'))['era5land_temperature_2m']
-            ds_obs_s = ds_obs.sel(date=slice('2015-01-01', '2024-09-30'))['era5land_surface_net_solar_radiation']
+            ds_obs_p = ds_obs['era5land_total_precipitation']
+            ds_obs_t = ds_obs['era5land_temperature_2m']
+            ds_obs_s = ds_obs['era5land_surface_net_solar_radiation']
 
             ds_fcst = ds_fcst_all.sel(basin=f'camels_{gaugeID}')
-
-            # ds_fcst   = xr.open_zarr(base_fcst + 'camels_rechunked.zarr',decode_timedelta=True).sel(basin=f'camels_{gaugeID}')
     
             for fcst_date in forecast_dates:
                 try:
@@ -371,22 +302,22 @@ for split, forecast_dates in forecast_blocks.items():
                             f"Precip shape changed from {expected_precip_shape} "
                             f"to {sample['precip'].shape}"
                         )
-                    # ---------------------------------
-                    
-                    # dataset_store[split].append(sample)
+                    # ---------------------------------                    
                     intermediate_store.append(sample)
 
                     if len(intermediate_store) == BATCH_SIZE:
                         write_batch(split, intermediate_store, count)
                         count += 1
                         intermediate_store.clear()
-                        del ds_obs, ds_fcst, ds_obs_p, ds_obs_t, ds_obs_s
-                        gc.collect()
-                
+                        
                 except Exception as e:
                     print(f"Skipping {fcst_date} for {gaugeID} due to error: {e}")
                     continue
-    
+                        
+            # After processing all forecast dates for one gauge:
+            del ds_obs, ds_fcst, ds_obs_p, ds_obs_t, ds_obs_s
+            gc.collect()
+        
         except Exception as e:
             print(f"Failed to process gauge {gaugeID}: {e}")
 
@@ -394,10 +325,47 @@ for split, forecast_dates in forecast_blocks.items():
     if intermediate_store:
         write_batch(split, intermediate_store, count)
         print(f"✅ Final batch written for split '{split}'")
-        
+
+
 if False:  # change to True when you're ready
     for split in ["train", "validation", "test"]:
         files = f"/Projects/HydroMet/currierw/HRES_processed/{split}_data_batch*.nc"
         ds_all = xr.open_mfdataset(files, combine='nested', concat_dim='sample')
         ds_all.to_netcdf(f"/Projects/HydroMet/currierw/HRES_processed/{split}_data_combined.nc")
 
+
+# def get_usgs_streamflow(site, start_date, end_date):
+#     """
+#     Download daily streamflow data from USGS NWIS for a given site and date range.
+
+#     Parameters:
+#         site (str): USGS site number (gauge ID)
+#         start_date (str): Start date in 'YYYY-MM-DD'
+#         end_date (str): End date in 'YYYY-MM-DD'
+
+#     Returns:
+#         pd.DataFrame: DataFrame with datetime and streamflow values in cfs
+#     """
+#     url = (
+#         "https://waterservices.usgs.gov/nwis/dv/"
+#         "?format=rdb&sites={site}&startDT={start}&endDT={end}"
+#         "&parameterCd=00060&siteStatus=all"
+#     ).format(site=site, start=start_date, end=end_date)
+
+#     df = pd.read_csv(url, comment='#', sep='\t', header=1, parse_dates=['20d'])
+#     df = df.rename(columns={'14n': 'streamflow_cfs'})
+#     df = df.rename(columns={'20d': 'date'})
+#     df['streamflow_cfs'] = pd.to_numeric(df['streamflow_cfs'], errors='coerce')
+
+#     # Convert to cubic meters per second (cms)
+#     df['streamflow_cms'] = df['streamflow_cfs'] * 0.0283168
+#     df = df[['date', 'streamflow_cms']]
+#     df = df.set_index('date')
+
+#     return df
+
+
+
+# -----------------------------------
+# Loop through Gauges and Forecast Dates
+# -----------------------------------
