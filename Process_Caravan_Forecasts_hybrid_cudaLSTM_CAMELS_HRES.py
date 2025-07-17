@@ -15,7 +15,7 @@ from collections import Counter
 import glob
 import re
 import gc
-
+import time
 # -----------------------------------
 # Setup
 # -----------------------------------
@@ -98,21 +98,18 @@ def get_last_batch_number(split, output_dir=output_dir):
             batch_nums.append(int(match.group(1)))
     return max(batch_nums) + 1  # Resume at next batch number
 
-def to_xarray_dataset(samples, split=None, standardize=False):
+def to_xarray_dataset(samples, EXPECTED_LEN, split=None, standardize=False):
     # Step 1: Count all time lengths (based on 'precip')
     lengths = [s['precip'].shape[0] for s in samples]
     length_counts = Counter(lengths)
-
-    # Step 2: Infer most common sequence length
-    EXPECTED_LEN, _ = length_counts.most_common(1)[0]
 
     REQUIRED_KEYS = ['precip', 'temp', 'net_solar', 'target', 'flag']
 
     # Optional: Print samples with mismatched array lengths
     for s in samples:
         lengths = {k: s[k].shape[0] for k in REQUIRED_KEYS}
-        if len(set(lengths.values())) > 1:
-            print(f"⚠️ Mismatched lengths for sample {s['forecast_date']} / {s['basin_id']}: {lengths}")
+        # if len(set(lengths.values())) > 1:
+            # print(f"⚠️ Mismatched lengths for sample {s['forecast_date']} / {s['basin_id']}: {lengths}")
 
     # Step 3: Keep only samples where ALL arrays match EXPECTED_LEN
     clean_samples = [
@@ -166,8 +163,8 @@ def to_xarray_dataset(samples, split=None, standardize=False):
         }
     )
     
-def write_batch(split, batch, count):
-    ds = to_xarray_dataset(batch, split=split, standardize=False)
+def write_batch(split, batch, count, EXPECTED_LEN):
+    ds = to_xarray_dataset(batch, EXPECTED_LEN, split=split, standardize=False)
     fname = f"{split}_data_batch{count:05d}.nc"
     path = f"/Projects/HydroMet/currierw/HRES_processed/{fname}"
     ds.to_netcdf(path)
@@ -176,6 +173,7 @@ def write_batch(split, batch, count):
 # -----------------------------------
 # Main Loop
 # -----------------------------------
+start = time.time()
 
 for split, forecast_dates in forecast_blocks.items():
 
@@ -219,6 +217,7 @@ for split, forecast_dates in forecast_blocks.items():
             ds_fcst = ds_fcst_all.sel(basin=f'camels_{gaugeID}')
     
             for fcst_date in forecast_dates:
+                print(f"⏱️ Done {gaugeID} {fcst_date} in {time.time() - start:.2f}s", flush=True)
                 try:
                     # make weekly window
                     start_weekly = fcst_date - pd.Timedelta(days=305)
@@ -303,29 +302,51 @@ for split, forecast_dates in forecast_blocks.items():
                             f"to {sample['precip'].shape}"
                         )
                     # ---------------------------------                    
-                    intermediate_store.append(sample)
-
-                    if len(intermediate_store) == BATCH_SIZE:
-                        write_batch(split, intermediate_store, count)
-                        count += 1
-                        intermediate_store.clear()
-                        
+                    # ✅ Validate sample BEFORE adding it
+                    valid = True
+                    try:
+                        if np.isnan(sample["precip"]).any():
+                            raise ValueError("NaNs found in precip array")
+                        if np.isnan(sample["target"]).any():
+                            raise ValueError("No Streamflow Data Available")
+                        if sample["precip"].shape != (EXPECTED_LEN,):
+                            raise ValueError("Precip shape mismatch")
+                        if sample["target"].shape != (EXPECTED_LEN,):
+                            raise ValueError("Target shape mismatch")
+                    except ValueError as ve:
+                        print(f"⚠️ Skipping invalid sample for {gaugeID} {fcst_date.date()}: {ve}")
+                        valid = False
+                    
+                    if valid:
+                        intermediate_store.append(sample)
+                        print(f"📦 Batch size: {len(intermediate_store)}", flush=True)
+                    
+                        if len(intermediate_store) == BATCH_SIZE:
+                            write_batch(split, intermediate_store, count, EXPECTED_LEN)
+                            count += 1
+                            intermediate_store.clear()
+                                            
                 except Exception as e:
                     print(f"Skipping {fcst_date} for {gaugeID} due to error: {e}")
                     continue
                         
             # After processing all forecast dates for one gauge:
             del ds_obs, ds_fcst, ds_obs_p, ds_obs_t, ds_obs_s
-            gc.collect()
-        
+            # gc.collect()
+            
+            print(f"✅ Finished {gaugeID}", flush=True)
+
         except Exception as e:
             print(f"Failed to process gauge {gaugeID}: {e}")
 
     # Write final remainder
     if intermediate_store:
-        write_batch(split, intermediate_store, count)
-        print(f"✅ Final batch written for split '{split}'")
-
+        try:
+            write_batch(split, intermediate_store, count, EXPECTED_LEN)
+            print(f"✅ Final batch written for split '{split}'")
+        except ValueError as e:
+            print(f"⚠️ Skipping final batch due to invalid samples: {e}")
+        intermediate_store.clear()
 
 if False:  # change to True when you're ready
     for split in ["train", "validation", "test"]:
